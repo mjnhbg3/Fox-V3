@@ -31,12 +31,17 @@ class TTS(Cog):
         self.config.register_global(**default_global)
         self.config.register_guild(**default_guild)
 
+    async def cog_load(self):
+        self.tts_slash = app_commands.Command(
+            name="tts",
+            description="Send Text to speech messages",
+            callback=self.tts_slash_callback
+        )
+        self.bot.tree.add_command(self.tts_slash)
+
     async def red_delete_data_for_user(self, **kwargs):
         """Nothing to delete"""
         return
-
-    async def cog_load(self):
-        self.bot.tree.add_command(self.tts_slash)
 
     @commands.is_owner()
     @commands.command()
@@ -57,40 +62,6 @@ class TTS(Cog):
         await self.config.guild(ctx.guild).voice.set(voice)
         await ctx.send(f"Default TTS voice set to {voice}")
 
-    async def generate_tts(self, text: str, voice: str) -> io.BytesIO:
-        api_key = await self.config.api_key()
-        if not api_key:
-            raise ValueError("OpenAI API key is not set.")
-
-        openai.api_key = api_key
-
-        response = openai.audio.speech.create(
-            model="tts-1",
-            voice=voice,
-            input=text
-        )
-
-        return io.BytesIO(response.content)
-
-    async def play_audio(self, ctx, audio: io.BytesIO):
-        if not ctx.author.voice:
-            await ctx.send("You need to be in a voice channel to use this command.")
-            return
-
-        voice_channel = ctx.author.voice.channel
-        voice_client = ctx.voice_client
-
-        if voice_client is None:
-            voice_client = await voice_channel.connect()
-        elif voice_client.channel != voice_channel:
-            await voice_client.move_to(voice_channel)
-
-        audio.seek(0)
-        voice_client.play(discord.FFmpegPCMAudio(audio, pipe=True))
-        while voice_client.is_playing():
-            await discord.asyncio.sleep(0.1)
-        await voice_client.disconnect()
-
     @commands.command(aliases=["t2s", "text2"])
     @commands.guild_only()
     async def tts(
@@ -101,71 +72,82 @@ class TTS(Cog):
         text: str,
     ):
         """
-        Send Text to speech messages in the voice channel using OpenAI's TTS
+        Send Text to speech messages
+        """
+        await self.tts_logic(ctx, voice, text)
+
+    async def tts_slash_callback(
+        self,
+        interaction: discord.Interaction,
+        voice: Optional[str] = None,
+        text: str = "",
+    ):
+        """
+        Slash command version of TTS
+        """
+        ctx = await self.bot.get_context(interaction)
+        if voice:
+            try:
+                voice = await VoiceConverter().convert(ctx, voice)
+            except BadArgument as e:
+                await interaction.response.send_message(str(e), ephemeral=True)
+                return
+        await interaction.response.defer()
+        await self.tts_logic(ctx, voice, text, is_slash=True)
+
+    async def tts_logic(
+        self,
+        ctx: commands.Context,
+        voice: Optional[str] = None,
+        text: str = "",
+        is_slash: bool = False,
+    ):
+        """
+        Common logic for both regular and slash TTS commands
         """
         if voice is None:
             voice = await self.config.guild(ctx.guild).voice()
 
+        api_key = await self.config.api_key()
+        if not api_key:
+            return await self.send_response(ctx, "OpenAI API key is not set. Please ask the bot owner to set it.", is_slash)
+
+        openai.api_key = api_key
+
         try:
-            audio = await self.generate_tts(text, voice)
-            await self.play_audio(ctx, audio)
+            response = openai.audio.speech.create(
+                model="tts-1",
+                voice=voice,
+                input=text
+            )
+
+            mp3_fp = io.BytesIO(response.content)
+            mp3_fp.seek(0)
+
+            if ctx.author.voice:
+                vc = await ctx.author.voice.channel.connect()
+                vc.play(discord.FFmpegPCMAudio(mp3_fp, pipe=True))
+                while vc.is_playing():
+                    await discord.asyncio.sleep(0.1)
+                await vc.disconnect()
+                await self.send_response(ctx, "TTS message played in voice channel.", is_slash)
+            else:
+                await self.send_response(ctx, file=discord.File(mp3_fp, "tts_audio.mp3"), is_slash)
         except Exception as e:
             log.error(f"Error in TTS command: {str(e)}", exc_info=True)
-            await ctx.send(f"An error occurred while generating or playing the TTS: {str(e)}")
+            await self.send_response(ctx, f"An error occurred while generating the TTS: {str(e)}", is_slash)
 
-    @app_commands.command(name="tts", description="Send Text to speech messages in the voice channel")
-    @app_commands.describe(
-        voice="The voice to use for TTS (optional)",
-        text="The text to convert to speech"
-    )
-    async def tts_slash(
-        self,
-        interaction: discord.Interaction,
-        voice: Optional[str] = None,
-        text: str = None,
-    ):
-        if voice is None:
-            voice = await self.config.guild(interaction.guild).voice()
+    async def send_response(self, ctx, content=None, is_slash=False, **kwargs):
+        """
+        Helper method to send responses for both regular and slash commands
+        """
+        if is_slash:
+            if isinstance(ctx, discord.Interaction):
+                if ctx.response.is_done():
+                    await ctx.followup.send(content, **kwargs)
+                else:
+                    await ctx.response.send_message(content, **kwargs)
+            else:
+                await ctx.send(content, **kwargs)
         else:
-            try:
-                voice = await VoiceConverter().convert(None, voice)
-            except BadArgument as e:
-                await interaction.response.send_message(str(e), ephemeral=True)
-                return
-
-        if text is None:
-            await interaction.response.send_message("Please provide some text to convert to speech.", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-
-        try:
-            audio = await self.generate_tts(text, voice)
-            await self.play_audio(interaction, audio)
-            await interaction.followup.send("TTS message played successfully!")
-        except Exception as e:
-            log.error(f"Error in TTS slash command: {str(e)}", exc_info=True)
-            await interaction.followup.send(f"An error occurred while generating or playing the TTS: {str(e)}")
-
-    async def play_audio(self, ctx, audio: io.BytesIO):
-        if isinstance(ctx, discord.Interaction):
-            voice_state = ctx.user.voice
-        else:
-            voice_state = ctx.author.voice
-
-        if not voice_state:
-            raise ValueError("You need to be in a voice channel to use this command.")
-
-        voice_channel = voice_state.channel
-        voice_client = ctx.guild.voice_client
-
-        if voice_client is None:
-            voice_client = await voice_channel.connect()
-        elif voice_client.channel != voice_channel:
-            await voice_client.move_to(voice_channel)
-
-        audio.seek(0)
-        voice_client.play(discord.FFmpegPCMAudio(audio, pipe=True))
-        while voice_client.is_playing():
-            await discord.asyncio.sleep(0.1)
-        await voice_client.disconnect()
+            await ctx.send(content, **kwargs)
